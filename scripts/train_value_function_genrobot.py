@@ -37,6 +37,7 @@ import h5py
 import cv2
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +71,69 @@ from dataset import PikaHDF5Dataset
 from config import CAMERA_CONFIGS, NUM_BINS, VALUE_MIN, VALUE_MAX
 from valuefunc import SigLIPGemmaValueFunction,value_to_bin
 from episode import load_prompt_from_instructions,check_dataset_split,split_dataset_episodes
+from torch.utils.tensorboard import SummaryWriter
+
+def get_task_max_len(data_root: str, task_name: str) -> int:
+    task_dir = Path(data_root) / task_name
+    max_len = 0
+    for ep_dir in task_dir.glob("episode_*"):
+        hdf5_path = ep_dir / "data.hdf5"
+        if not hdf5_path.exists():
+            continue
+        try:
+            with h5py.File(hdf5_path, "r") as f:
+                L = int(f["size"][()])
+            if L > max_len:
+                max_len = L
+        except Exception:
+            continue
+    return max_len
+
+# def compute_task_max_len(episodes, desc="统计 task max_len"):
+#     """
+#     episodes: List[Dict]，每个 dict 至少包含 episode_dir, task_name
+#     return: Dict[str,int] task_name -> max episode_len
+#     """
+#     task2max = defaultdict(int)
+
+#     for ep in tqdm(episodes, desc=desc):
+#         episode_dir = ep["episode_dir"]
+#         task_name = str(ep.get("task_name", "unknown"))
+#         hdf5_path = os.path.join(episode_dir, "data.hdf5")
+#         if not os.path.exists(hdf5_path):
+#             continue
+
+#         try:
+#             with h5py.File(hdf5_path, "r") as f:
+#                 L = int(f["size"][()])
+#             if L > task2max[task_name]:
+#                 task2max[task_name] = L
+#         except Exception:
+#             continue
+
+#     return dict(task2max)
+
+def compute_task_max_len_from_path(episodes, desc="统计 task max_len"):
+    task2max = defaultdict(int)
+
+    for ep in tqdm(episodes, desc=desc):
+        episode_dir = ep["episode_dir"]
+        # 关键：从路径推断 task
+        task_key = Path(episode_dir).parent.name  # e.g. lace_up_shoes_with_both_hands
+
+        hdf5_path = os.path.join(episode_dir, "data.hdf5")
+        if not os.path.exists(hdf5_path):
+            continue
+
+        try:
+            with h5py.File(hdf5_path, "r") as f:
+                L = int(f["size"][()])
+            if L > task2max[task_key]:
+                task2max[task_key] = L
+        except Exception:
+            continue
+
+    return dict(task2max)
 
 # ============================================
 # 训练
@@ -94,23 +158,33 @@ def train(args):
     train_episodes = split_info["train"]
     val_episodes = split_info["val"]
     test_episodes = split_info["test"]
+    # 合并 train/val/test，用全量来统计 task max_len（更稳）
+    all_episodes = split_info["train"] + split_info["val"] + split_info["test"]
+    task_max_len = compute_task_max_len_from_path(all_episodes)
+
+    # 可选：打印看看
+    print("[TaskMaxLen] 示例：", list(task_max_len.items())[:5])
+
     if args.max_episodes:
         train_episodes = train_episodes[:args.max_episodes]
 
     train_dataset = PikaHDF5Dataset(
         episodes=train_episodes,
         image_size=args.image_size,
+        task_max_len=task_max_len,
         camera_type=args.camera_type,
     )
 
     val_dataset = PikaHDF5Dataset(
         episodes=val_episodes,
         image_size=args.image_size,
+        task_max_len=task_max_len,
         camera_type=args.camera_type,
     )
     test_dataset = PikaHDF5Dataset(
         episodes=test_episodes,
         image_size=args.image_size,
+        task_max_len=task_max_len,
         camera_type=args.camera_type,
     )
 
@@ -123,6 +197,7 @@ def train(args):
             'value_target': torch.stack([b['value_target'] for b in batch]),
             'value_bin': torch.stack([b['value_bin'] for b in batch]),
         }
+    
 
     
     train_loader = DataLoader(
@@ -201,7 +276,6 @@ def train(args):
             # wrist_images = batch['wrist_image'].to(device)
             images = batch["image"].to(device, non_blocking=True).float().div_(255.0)
             wrist_images = batch["wrist_image"].to(device, non_blocking=True).float().div_(255.0)
-
             prompts = batch['prompt']
             value_bins = batch['value_bin'].to(device)
             
@@ -237,6 +311,7 @@ def train(args):
         train_losses.append(train_loss)
         
         print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.4f}")
+        
         
         # 验证
         model.eval()
@@ -283,7 +358,7 @@ def train(args):
             }, output_dir / "best_model.pt")
             print(f"  保存最佳模型 (Val Loss: {val_loss:.4f})")
         
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 1 == 0:   #每个检查点都保存
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -303,8 +378,11 @@ def train(args):
         total_loss = total_acc = total_mae = 0.0
         with torch.no_grad():
             for batch in tqdm(loader, desc="评估", leave=False):
-                images = batch['image'].to(device)
-                wrist_images = batch['wrist_image'].to(device)
+                # images = batch['image'].to(device)
+                # wrist_images = batch['wrist_image'].to(device)
+                images = batch["image"].to(device, non_blocking=True).float().div_(255.0)
+                wrist_images = batch["wrist_image"].to(device, non_blocking=True).float().div_(255.0)
+
                 prompts = batch['prompt']
                 value_bins = batch['value_bin'].to(device)
                 value_targets = batch['value_target'].to(device)
@@ -417,32 +495,37 @@ def evaluate(args):
     if isinstance(instr, dict):
         prompt = instr.get("prompt")
         is_success = instr.get("success")
+        task_name = instr.get("task_name", "unknown")
 
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError(f"评估失败：{episode_dir/'instructions.json'} 缺少有效 prompt")
     prompt = prompt.strip()
+
         
     # 计算真实 Value
-    gamma = 0.99
-    rewards = []
+    # 论文式 true value：negative remaining steps until success（失败额外 -C_fail）
+    C_FAIL = 50.0  # 与你数据里失败终止惩罚保持一致（也可以设成 >= T_task 更容易饱和到 -1）
+
+    T_task = get_task_max_len(args.data_dir, task_name)
+    if T_task <= 1:
+        raise ValueError(f"无法获得 task={task_name} 的 max_len（检查 data_dir/任务目录结构）")
+
+    denom = max(1, T_task - 1)          # task 的最大“剩余步数”尺度
+    T = episode_len - 1                 # 当前 episode 终止步（假设终止在最后一帧）
+
+    true_values = []
     for t in range(episode_len):
-        if t == episode_len - 1:
-            rewards.append(0.0 if is_success else -50.0)
-        else:
-            rewards.append(-1.0)
-    
-    raw_values = []
-    for t in range(episode_len):
-        v = sum((gamma ** (i - t)) * rewards[i] for i in range(t, episode_len))
-        raw_values.append(v)
-    
-    min_value = min(raw_values)
-    max_value = 0.0
-    if abs(max_value - min_value) < 1e-6:
-        true_values = [0.0] * episode_len
-    else:
-        true_values = [(v - min_value) / (max_value - min_value) - 1.0 for v in raw_values]
-        true_values = [max(-1.0, min(0.0, v)) for v in true_values]
+        remaining = T - t               # 到终止还剩多少步（成功时 remaining=0 表示完成）
+        v = -float(remaining)           # 成功轨迹：0, -1, -2, ...（越早越小）
+        if (t == T) and (not is_success):
+            v -= float(C_FAIL)
+        v = v / float(denom)            # 归一化到大致 (-1, 0)
+        v = max(-1.0, min(0.0, v))      # clip 到 (-1, 0)
+        true_values.append(v)
+
+    true_values = np.asarray(true_values, dtype=np.float32)
+
+
     
     print(f"轨迹结果: {'成功' if is_success else '失败'}")
     print(f"轨迹长度: {episode_len}")
@@ -527,7 +610,7 @@ def evaluate(args):
     
     plt.tight_layout()
     
-    output_path = Path(args.checkpoint).parent / f"eval_{episode_dir.name}.png"
+    output_path = Path(args.checkpoint).parent / f"eval_{task_name}_{episode_dir.name}.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     
@@ -536,7 +619,7 @@ def evaluate(args):
     # 如果需要生成视频
     if args.save_video:
         print("\n生成评估视频...")
-        video_path = Path(args.checkpoint).parent / f"eval_{episode_dir.name}.mp4"
+        video_path = Path(args.checkpoint).parent / f"eval_{task_name}_{episode_dir.name}.mp4"
         
         actual_len = len(pred_values)
         
@@ -683,9 +766,9 @@ def main():
                         help="随机种子")
     
     # 评估配置
-    parser.add_argument("--checkpoint", type=str, default="./genrobot/checkpoints/value_genrobot/run_20260108_145315/best_model.pt",
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints/run_20260109_213740/best_model.pt",
                         help="模型 checkpoint 路径")
-    parser.add_argument("--episode_path", type=str, default="data/clean_bowl/episode_90",
+    parser.add_argument("--episode_path", type=str, default="data/lace_up_shoes_with_both_hands/episode_37",   #test:unscrew_bottle_cap_and_pour/episode_20   clean_container/episode_70 lace_up_shoes_with_both_hands/episode_19  train:clean_bowl/episode_32  lace_up_shoes_with_both_hands/episode_37
                     help="评估的 episode 目录路径")
     parser.add_argument("--save_video", action="store_true",
                         help="生成评估视频")
