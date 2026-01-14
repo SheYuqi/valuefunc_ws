@@ -109,7 +109,6 @@ class SigLIPGemmaValueFunction(nn.Module):
         # ==================== 融合层 ====================
         # 2张图像 + 文本 = 3 * hidden_dim
         fusion_input_dim = 3 * hidden_dim
-        
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden_dim * 2),
             nn.LayerNorm(hidden_dim * 2),
@@ -137,7 +136,6 @@ class SigLIPGemmaValueFunction(nn.Module):
     def _init_vision_encoder(self, variant: str, freeze: bool):
         """初始化 SigLIP 视觉编码器"""
         model_name = SIGLIP_MODELS.get(variant, SIGLIP_MODELS["so400m"])
-        
         print(f"加载 SigLIP: {model_name}")
         self.vision_encoder = SiglipVisionModel.from_pretrained(
             model_name,
@@ -156,14 +154,10 @@ class SigLIPGemmaValueFunction(nn.Module):
     def _init_language_model(self, variant: str, freeze: bool, use_flash_attention: bool):
         """初始化 Gemma 语言模型"""
         model_name = GEMMA_MODELS.get(variant, GEMMA_MODELS["gemma3-270m"])
-        
         print(f"加载 Gemma: {model_name}")
         
         # 加载 tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name,trust_remote_code=True,)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
@@ -295,15 +289,11 @@ class SigLIPGemmaValueFunction(nn.Module):
             right_proj,
             text_proj,
         ], dim=-1)  # [batch, 3 * hidden_dim]
-        
         fused = self.fusion(combined)  # [batch, hidden_dim]
-        
         # Value Head
         logits = self.value_head(fused)  # [batch, num_bins]
-        
         # 计算连续 value
         value = bins_to_value_soft(logits)  # [batch]
-        
         return logits, value
 
 
