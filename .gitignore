@@ -12,6 +12,7 @@ datasets/
 checkpoints/
 outputs/
 wandb/
+eval_record/
 
 # Logs
 *.log

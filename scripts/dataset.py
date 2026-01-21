@@ -38,7 +38,7 @@ class PikaHDF5Dataset(Dataset):
         task_max_len: Optional[Dict[str, int]] = None,
     ):
         self.data_dir = data_dir
-        self.episodes = episode_dirs  # FIX: 原来你写 self.episode_dirs 但 _load_data 用 self.episodes
+        self.episodes = episode_dirs  
         self.image_size = image_size
         self.camera_type = camera_type
         self.samples: List[Dict] = []
@@ -94,10 +94,14 @@ class PikaHDF5Dataset(Dataset):
                 # 失败：在终止帧额外 -C_FAIL，再归一化并 clip
                 T = episode_len - 1
                 T_task = int(self.task_max_len.get(task_name, 0))
+                # print(f"[Dataset] 任务 {task_name} 的最大步数: {T_task}, 本 episode 长度: {episode_len}")
+
                 if T_task <= 1:
                     # 回退：至少保证 denom>=1
                     T_task = max(2, episode_len)
+                    # print(f"[Dataset] 任务 {task_name} 未指定最大步数，使用 episode 长度回退 T_task={T_task}")
                 denom = max(1, T_task - 1)
+                
 
                 normalized_values = []
                 for t in range(episode_len):

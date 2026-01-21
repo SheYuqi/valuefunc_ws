@@ -25,7 +25,6 @@ import argparse
 import h5py
 import cv2
 from datetime import datetime
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
@@ -44,7 +43,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset import PikaHDF5Dataset
 from config import CAMERA_CONFIGS, NUM_BINS
 from valuefunc import SigLIPGemmaValueFunction, value_to_bin
-from episode import load_prompt_from_instructions, check_dataset_split, split_dataset_episodes
+from episode import load_prompt_from_instructions, check_dataset_split, split_dataset_episodes, compute_task_max_len_from_path, get_task_max_len, scan_episodes, relpath_under, split_episodes_by_task
 
 
 # -----------------------------
@@ -66,39 +65,6 @@ plt.rcParams["axes.unicode_minus"] = False
 # -----------------------------
 # utils
 # -----------------------------
-def compute_task_max_len_from_path(episodes: List[Dict], desc="统计 task max_len") -> Dict[str, int]:
-    task2max = defaultdict(int)
-    for ep in tqdm(episodes, desc=desc):
-        episode_dir = ep["episode_dir"]
-        task_key = Path(episode_dir).parent.name
-        hdf5_path = os.path.join(episode_dir, "data.hdf5")
-        if not os.path.exists(hdf5_path):
-            continue
-        try:
-            with h5py.File(hdf5_path, "r") as f:
-                L = int(f["size"][()])
-            if L > task2max[task_key]:
-                task2max[task_key] = L
-        except Exception:
-            continue
-    return dict(task2max)
-
-
-def get_task_max_len(data_root: str, task_name: str) -> int:
-    task_dir = Path(data_root) / task_name
-    max_len = 0
-    for ep_dir in task_dir.glob("episode_*"):
-        hdf5_path = ep_dir / "data.hdf5"
-        if not hdf5_path.exists():
-            continue
-        try:
-            with h5py.File(hdf5_path, "r") as f:
-                L = int(f["size"][()])
-            if L > max_len:
-                max_len = L
-        except Exception:
-            continue
-    return max_len
 
 
 def _get_rng_state():
@@ -268,7 +234,8 @@ def train(args):
     best_val_mae = float("inf")
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+
         model.load_state_dict(ckpt["model_state_dict"], strict=True)
 
         if ckpt.get("optimizer_state_dict") is not None:
@@ -791,7 +758,7 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--image_size", type=int, default=384)
-    parser.add_argument("--max_episodes", type=int, default=None)
+    parser.add_argument("--max_episodes", type=int, default=None)  ## 限制训练集样本数（调试用）
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
@@ -802,8 +769,8 @@ def main():
     parser.add_argument("--eval_test_at_end", action="store_true", help="训练结束在 test 集汇报一次（不用于选模型）")
 
     # eval
-    parser.add_argument("--checkpoint", type=str, default=None, help="模型 checkpoint 路径")
-    parser.add_argument("--episode_path", type=str, default=None, help="评估 episode 目录路径")
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints/run_20260113_205201/best_model.pt", help="模型 checkpoint 路径")
+    parser.add_argument("--episode_path", type=str, default="./data/", help="评估 episode 目录路径")
     parser.add_argument("--save_video", action="store_true", help="生成评估视频")
 
     args = parser.parse_args()

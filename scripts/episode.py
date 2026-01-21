@@ -6,6 +6,10 @@ import random
 import json
 from pathlib import Path
 from typing import List, Dict, Optional,Tuple
+from collections import defaultdict
+from tqdm import tqdm
+import os
+import h5py
 
 def load_prompt_from_instructions(ep_dir: Path) -> Optional[Dict]:
     p = ep_dir / "instructions.json"
@@ -182,3 +186,38 @@ def split_dataset_episodes(
     print(f"划分信息已保存到: {split_file}")
     return split
 
+
+def compute_task_max_len_from_path(episodes: List[Dict], desc="统计 task max_len") -> Dict[str, int]:
+    task2max = defaultdict(int)
+    for ep in tqdm(episodes, desc=desc):
+        episode_dir = ep["episode_dir"]
+        task_key = Path(episode_dir).parent.name
+        # print("task_key:",task_key)
+        hdf5_path = os.path.join(episode_dir, "data.hdf5")
+        if not os.path.exists(hdf5_path):
+            continue
+        try:
+            with h5py.File(hdf5_path, "r") as f:
+                L = int(f["size"][()])
+            if L > task2max[task_key]:
+                task2max[task_key] = L
+        except Exception:
+            continue
+    return dict(task2max)
+
+
+def get_task_max_len(data_root: str, task_name: str) -> int:
+    task_dir = Path(data_root) / task_name
+    max_len = 0
+    for ep_dir in task_dir.glob("episode_*"):
+        hdf5_path = ep_dir / "data.hdf5"
+        if not hdf5_path.exists():
+            continue
+        try:
+            with h5py.File(hdf5_path, "r") as f:
+                L = int(f["size"][()])
+            if L > max_len:
+                max_len = L
+        except Exception:
+            continue
+    return max_len
