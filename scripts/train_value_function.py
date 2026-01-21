@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-SigLIP + Gemma 3 270M Value Function Training (Pika HDF5)
-
-修复点：
-- Dataset: task_max_len / c_fail 对齐 evaluate 归一化
-- global_step: 不再每个 epoch 重置
-- 验证集: 使用 val_loader（不再用 test_loader 选 best）
-- best_val_loss: 正确更新
-- final_model: 不再被重复覆盖
-- resume: optimizer/scheduler/scaler/global_step 恢复 + TensorBoard purge_step
-"""
-
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -22,11 +10,9 @@ matplotlib.use("Agg")
 
 import random
 import argparse
-import h5py
-import cv2
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+
 
 import numpy as np
 import torch
@@ -41,9 +27,9 @@ import matplotlib.font_manager as fm
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import PikaHDF5Dataset
-from config import CAMERA_CONFIGS, NUM_BINS
-from valuefunc import SigLIPGemmaValueFunction, value_to_bin
-from episode import load_prompt_from_instructions, check_dataset_split, split_dataset_episodes, compute_task_max_len_from_path, get_task_max_len, scan_episodes, relpath_under, split_episodes_by_task
+from config import NUM_BINS
+from valuefunc import SigLIPGemmaValueFunction
+from episode import check_dataset_split, split_dataset_episodes, compute_task_max_len_from_path
 
 
 # -----------------------------
@@ -334,7 +320,6 @@ def train(args):
 
         print(f"Epoch {epoch+1}: Train CE={train_loss:.4f}, Train Acc={train_acc:.4f}")
 
-        # ---------- validate on val_loader (NO test leakage) ----------
         model.eval()
         val_ce = val_top1 = val_mae = val_huber = val_acc1 = val_acc2 = val_entropy = 0.0
 
@@ -494,252 +479,12 @@ def train(args):
         test_ce, test_top1, test_mae = eval_on_loader(model, test_loader, device, criterion)
         print(f"[Test] CE={test_ce:.4f}, Top1={test_top1:.4f}, MAE={test_mae:.4f}")
 
-
-def eval_on_loader(model, loader, device, criterion):
-    model.eval()
-    ce = top1 = mae = 0.0
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="TestEval", leave=False):
-            images = batch["image"].to(device, non_blocking=True)
-            wrist_images = batch["wrist_image"].to(device, non_blocking=True)
-            prompts = batch["prompt"]
-            value_bins = batch["value_bin"].to(device, non_blocking=True)
-            value_targets = batch["value_target"].to(device, non_blocking=True)
-
-            logits, pred_values = model(images, wrist_images, prompts)
-            loss_ce = criterion(logits, value_bins)
-
-            pred_bins = logits.argmax(dim=-1)
-            diff = (pred_bins - value_bins).abs()
-            t1 = (diff == 0).float().mean()
-
-            m = (pred_values - value_targets).abs().mean()
-
-            ce += loss_ce.item()
-            top1 += t1.item()
-            mae += m.item()
-
-    n = max(1, len(loader))
-    return ce / n, top1 / n, mae / n
-
-
-# -----------------------------
-# evaluate single episode
-# -----------------------------
-def evaluate(args):
-    from matplotlib.animation import FuncAnimation
-    from matplotlib.gridspec import GridSpec
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-
-    print(f"加载模型: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict = checkpoint["model_state_dict"]
-
-    camera_type = checkpoint.get("camera_type", args.camera_type)
-    print(f"使用相机类型: {camera_type}")
-
-    if camera_type not in CAMERA_CONFIGS:
-        raise ValueError(f"不支持的相机类型: {camera_type}")
-
-    left_camera = CAMERA_CONFIGS[camera_type]["left"]
-    right_camera = CAMERA_CONFIGS[camera_type]["right"]
-
-    model = SigLIPGemmaValueFunction(
-        num_bins=NUM_BINS,
-        siglip_variant=args.siglip_variant,
-        gemma_variant=args.gemma_variant,
-        freeze_vision=True,
-        freeze_llm=True,
-        hidden_dim=args.hidden_dim,
-    ).to(device)
-
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    episode_dir = Path(args.episode_path)
-    hdf5_path = episode_dir / "data.hdf5"
-    if not hdf5_path.exists():
-        raise ValueError(f"HDF5 文件不存在: {hdf5_path}")
-
-    print(f"加载轨迹: {episode_dir}")
-
-    with h5py.File(hdf5_path, "r") as f:
-        episode_len = int(f["size"][()])
-        left_cam_paths = [f[f"camera/color/{left_camera}"][i].decode("utf-8") for i in range(episode_len)]
-        right_cam_paths = [f[f"camera/color/{right_camera}"][i].decode("utf-8") for i in range(episode_len)]
-
-    instr = load_prompt_from_instructions(episode_dir)
-    if not isinstance(instr, dict):
-        raise ValueError(f"评估失败：{episode_dir/'instructions.json'} 解析失败")
-    prompt = (instr.get("prompt") or "").strip()
-    is_success = bool(instr.get("success", True))
-    task_name = instr.get("task_name", Path(episode_dir).parent.name)
-
-    if not prompt:
-        raise ValueError(f"评估失败：{episode_dir/'instructions.json'} 缺少有效 prompt")
-
-    # true values (aligned)
-    C_FAIL = float(args.c_fail)
-    T_task = get_task_max_len(args.data_dir, task_name)
-    if T_task <= 1:
-        raise ValueError(f"无法获得 task={task_name} 的 max_len（检查 data_dir/任务目录结构）")
-
-    denom = max(1, T_task - 1)
-    T = episode_len - 1
-
-    true_values = []
-    for t in range(episode_len):
-        remaining = T - t
-        v = -float(remaining)
-        if (t == T) and (not is_success):
-            v -= C_FAIL
-        v = v / float(denom)
-        v = max(-1.0, min(0.0, v))
-        true_values.append(v)
-    true_values = np.asarray(true_values, dtype=np.float32)
-
-    print(f"轨迹结果: {'成功' if is_success else '失败'}")
-    print(f"轨迹长度: {episode_len}")
-    print(f"任务描述: {prompt}")
-
-    pred_values = []
-    pred_bins = []
-    left_images = []
-    right_images = []
-
-    with torch.no_grad():
-        for t in tqdm(range(episode_len), desc="预测"):
-            left_img_path = str(episode_dir / left_cam_paths[t])
-            right_img_path = str(episode_dir / right_cam_paths[t])
-
-            left_img = cv2.imread(left_img_path, cv2.IMREAD_COLOR)
-            right_img = cv2.imread(right_img_path, cv2.IMREAD_COLOR)
-            if left_img is None or right_img is None:
-                print(f"警告: 无法加载图像 {left_img_path} 或 {right_img_path}")
-                continue
-
-            left_img_rgb = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
-            right_img_rgb = cv2.cvtColor(right_img, cv2.COLOR_BGR2RGB)
-            left_images.append(left_img_rgb.copy())
-            right_images.append(right_img_rgb.copy())
-
-            with Image.open(left_img_path) as im:
-                im = im.convert("RGB")
-            left_tensor = model.image_processor(images=im, return_tensors="pt")["pixel_values"].to(device)
-
-            with Image.open(right_img_path) as im:
-                im = im.convert("RGB")
-            right_tensor = model.image_processor(images=im, return_tensors="pt")["pixel_values"].to(device)
-
-            logits, value = model(left_tensor, right_tensor, [prompt])
-            pred_values.append(value.item())
-            pred_bins.append(int(logits.argmax(dim=-1).item()))
-
-    pred_values = np.array(pred_values, dtype=np.float32)
-    true_values = np.array(true_values[:len(pred_values)], dtype=np.float32)
-
-    true_bins = np.array([value_to_bin(v) for v in true_values], dtype=np.int64)
-    pred_bins = np.array(pred_bins, dtype=np.int64)
-
-    mae = float(np.mean(np.abs(pred_values - true_values))) if len(pred_values) > 0 else 0.0
-    acc = float(np.mean(pred_bins == true_bins)) if len(pred_values) > 0 else 0.0
-    corr = float(np.corrcoef(pred_values, true_values)[0, 1]) if len(pred_values) > 1 else 0.0
-
-    print("\n评估结果:")
-    print(f"  MAE: {mae:.4f}")
-    print(f"  Bin Accuracy: {acc:.4f}")
-    print(f"  Correlation: {corr:.4f}")
-
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
-    frames = np.arange(len(pred_values))
-    ax.plot(frames, pred_values, "r-", label="Predicted Value", linewidth=2)
-    ax.fill_between(frames, pred_values, -1, alpha=0.2, color="red")
-    ax.plot(frames, true_values, "g--", label="True Value", linewidth=2)
-    ax.fill_between(frames, true_values, -1, alpha=0.2, color="green")
-    ax.set_xlabel("Frame")
-    ax.set_ylabel("Value")
-    ax.set_ylim(-1.1, 0.1)
-    status_text = "Success" if is_success else "Failure"
-    ax.set_title(f"Value Function Prediction | Status: {status_text}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    output_path = Path(args.checkpoint).parent / f"eval_{task_name}_{episode_dir.name}.png"
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"评估图保存至: {output_path}")
-
-    if args.save_video:
-        print("\n生成评估视频...")
-        video_path = Path(args.checkpoint).parent / f"eval_{task_name}_{episode_dir.name}.mp4"
-
-        actual_len = len(pred_values)
-        if actual_len <= 0:
-            print("没有有效帧，跳过视频生成")
-            return
-
-        camera_desc = CAMERA_CONFIGS[camera_type]["description"]
-        left_title = f"Left Camera ({camera_desc})"
-        right_title = f"Right Camera ({camera_desc})"
-
-        fig = plt.figure(figsize=(14, 8))
-        gs = GridSpec(2, 2, figure=fig, width_ratios=[1, 1.5], height_ratios=[1, 1])
-
-        ax_left = fig.add_subplot(gs[0, 0])
-        ax_right = fig.add_subplot(gs[1, 0])
-        ax_value = fig.add_subplot(gs[:, 1])
-
-        im_left = ax_left.imshow(left_images[0])
-        ax_left.set_title(left_title, fontsize=12, fontweight="bold")
-        ax_left.axis("off")
-
-        im_right = ax_right.imshow(right_images[0])
-        ax_right.set_title(right_title, fontsize=12, fontweight="bold")
-        ax_right.axis("off")
-
-        ax_value.set_xlim(0, actual_len - 1)
-        ax_value.set_ylim(-1.1, 0.1)
-        ax_value.set_xlabel("Frame", fontsize=11)
-        ax_value.set_ylabel("Value", fontsize=11)
-        ax_value.grid(True, alpha=0.3)
-
-        (line_pred,) = ax_value.plot([], [], "r-", label="Predicted Value", linewidth=2)
-        vline = ax_value.axvline(x=0, color="green", linestyle="--", linewidth=1.5, alpha=0.8)
-        scatter_pred = ax_value.scatter([], [], c="red", s=100, zorder=5, edgecolors="white", linewidths=2)
-
-        ax_value.legend(loc="lower right", fontsize=10)
-
-        title = fig.suptitle(
-            f"Task: {prompt}\nFrame: 0/{actual_len-1} | Status: {status_text}",
-            fontsize=11, fontweight="bold",
-        )
-
-        plt.tight_layout(rect=[0, 0, 1, 0.93])
-
-        def update(frame):
-            im_left.set_array(left_images[frame])
-            im_right.set_array(right_images[frame])
-            line_pred.set_data(np.arange(frame + 1), pred_values[: frame + 1])
-            vline.set_xdata([frame, frame])
-            scatter_pred.set_offsets([[frame, pred_values[frame]]])
-            title.set_text(f"Task: {prompt}\nFrame: {frame}/{actual_len-1} | Status: {status_text}")
-            return im_left, im_right, line_pred, vline, scatter_pred, title
-
-        anim = FuncAnimation(fig, update, frames=actual_len, interval=50, blit=False)
-        anim.save(str(video_path), writer="ffmpeg", fps=20, dpi=100, bitrate=2000)
-        plt.close()
-        print(f"视频保存至: {video_path}")
-
-
 # -----------------------------
 # main
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="SigLIP + Gemma Value Function Training (Pika HDF5)")
 
-    parser.add_argument("--mode", type=str, required=True, choices=["split", "train", "eval"], help="运行模式")
     parser.add_argument("--data_dir", type=str, default="data", help="数据根目录（包含各任务子目录）")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/", help="输出目录")
 
@@ -779,14 +524,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.mode == "split":
-        split_dataset_episodes(args.data_dir, seed=args.seed)
-    elif args.mode == "train":
-        train(args)
-    elif args.mode == "eval":
-        if not args.checkpoint or not args.episode_path:
-            raise ValueError("评估模式需要 --checkpoint 和 --episode_path")
-        evaluate(args)
+
+    train(args)
 
 
 if __name__ == "__main__":

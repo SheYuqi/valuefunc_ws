@@ -10,40 +10,24 @@ matplotlib.use("Agg")
 import random
 import argparse
 import h5py
-import cv2
-from datetime import datetime
-from collections import defaultdict
+
 from pathlib import Path
-from typing import Dict, List
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
-from torch.utils.tensorboard import SummaryWriter
-
-from dataset import PikaHDF5Dataset
 from config import CAMERA_CONFIGS, NUM_BINS
 from valuefunc import SigLIPGemmaValueFunction, value_to_bin
 from episode import check_dataset_split,compute_task_max_len_from_path,load_prompt_from_instructions
 
 
-from torch.utils.tensorboard import SummaryWriter
-
-# ===== 新增：用 PIL + SiglipImageProcessor 做正规预处理 =====
-from PIL import Image
-
-# 导入 transformers（必需）
-
-
 # =========================
-# 字体（保持你原来的）
+# 字体
 # =========================
 chinese_font_candidates = ['WenQuanYi Micro Hei', 'SimHei', 'Noto Sans CJK SC',
                           'Source Han Sans CN', 'Microsoft YaHei', 'STHeiti']
@@ -63,7 +47,7 @@ else:
 plt.rcParams['axes.unicode_minus'] = False
 
 # =========================
-# 断点续训：工具函数
+# 断点续训
 # =========================
 def save_checkpoint_atomic(state: dict, path: Path):
     path = Path(path)
@@ -74,7 +58,7 @@ def save_checkpoint_atomic(state: dict, path: Path):
 
 
 # ============================================
-# 评估（只改“送入 SigLIP 的图像预处理”，其它不动）
+# 评估
 # ============================================
 def evaluate(args):
     from matplotlib.animation import FuncAnimation
@@ -183,12 +167,10 @@ def evaluate(args):
                 print(f"警告: 跳过帧 {t}（读图失败）: {e}")
                 continue
 
-            # 用于视频显示
             left_images.append(np.asarray(left_pil))
             right_images.append(np.asarray(right_pil))
             kept_ts.append(t)
 
-            # 用 SigLIP processor 做一致预处理，得到 pixel_values: (1,3,H,W)
             left_tensor = model.image_processor(images=left_pil, return_tensors="pt")["pixel_values"].to(device)
             right_tensor = model.image_processor(images=right_pil, return_tensors="pt")["pixel_values"].to(device)
 
@@ -201,20 +183,18 @@ def evaluate(args):
     true_bins = np.array([value_to_bin(v) for v in true_values])
     pred_bins = np.array(pred_bins)
 
-    # ===== 计算 Advantage & I_t（并给出 token 文本）=====
-    # n-step（默认 1-step），与论文的 n-step advantage 形式一致
+    # ===== 计算 Advantage & I_t =====
+
     N = int(getattr(args, "adv_n", 1))
     N = max(1, N)
-    # 构造 normalized reward r_t / denom：非终止 -1/denom；终止 success=0；failure=-C_FAIL/denom
-    # 注意：如果你 kept_ts 丢了最后一帧，这里会退化为“最后一个 kept frame 当作终止”近似
+
     L = len(pred_values)
     r_norm = np.full((L,), -1.0 / float(denom), dtype=np.float32)
 
-    # 判断 kept_ts 是否包含 terminal step
     if kept_ts[-1] == T:
         r_norm[-1] = 0.0 if is_success else (-C_FAIL / float(denom))
     else:
-        # 近似：用最后一个 kept frame 作为终止
+
         r_norm[-1] = 0.0 if is_success else (-C_FAIL / float(denom))
 
     # n-step advantage: sum r + V_{t+N} - V_t；超出末尾时，用 0 作为 V_terminal
@@ -226,7 +206,6 @@ def evaluate(args):
 
     # ===== 阈值 eps 与 I_t =====
     # 论文里 eps_l 是 task 上 value 分布的 30% 分位；
-    # 工程可运行版本：不要用一个全局固定值（比如 -0.3）去套所有 task。论文说的是 εℓ（按 task）。建议：做 task_name -> eps_value 的字典查表。
     it_percentile = float(getattr(args, "it_percentile", 30.0))
     it_percentile = max(0.0, min(100.0, it_percentile))
 
@@ -262,21 +241,21 @@ def evaluate(args):
     ax.grid(True, alpha=0.3)
 
     # =========advantage on twin axis==========
-    # ax2 = ax.twinx()
-    # ax2.plot(frames, adv, "b-", label=f"Pred Advantage (n={N})", linewidth=1.5, alpha=0.9)
-    # ax2.axhline(y=eps, color="gray", linestyle=":", linewidth=1.2, alpha=0.8, label=f"eps(p{it_percentile:.0f})")
-    # ax2.set_ylabel("Advantage")
+    ax2 = ax.twinx()
+    ax2.plot(frames, adv, "b-", label=f"Pred Advantage (n={N})", linewidth=1.5, alpha=0.9)
+    ax2.axhline(y=eps, color="gray", linestyle=":", linewidth=1.2, alpha=0.8, label=f"eps(p{it_percentile:.0f})")
+    ax2.set_ylabel("Advantage")
 
     # I_t strip (colored squares near bottom of value axis)
     it_colors = ["green" if b else "red" for b in It.tolist()]
-    # ax.scatter(frames, np.full_like(frames, -1.05, dtype=np.float32), c=it_colors, s=10, marker="s", alpha=0.8, label="I_t")
+    ax.scatter(frames, np.full_like(frames, -1.05, dtype=np.float32), c=it_colors, s=10, marker="s", alpha=0.8, label="I_t")
 
     status_text = "Success" if is_success else "Failure"
-    # ax.set_title(f"Value+Advantage+I_t | Status: {status_text} | eps(p{it_percentile:.0f})={eps:.4f}")
+    ax.set_title(f"Value+Advantage+I_t | Status: {status_text} | eps(p{it_percentile:.0f})={eps:.4f}")
 
     # 合并 legend
     h1, l1 = ax.get_legend_handles_labels()
-    # h2, l2 = ax2.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 , l1 , loc="lower right", fontsize=9)
     # ============================================
 
@@ -402,7 +381,7 @@ def evaluate(args):
         print(f"视频保存至: {video_path}")
 
 # ============================================
-# 主函数（只加 resume + tb_log_interval）
+# 主函数
 # ============================================
 def main():
     parser = argparse.ArgumentParser(description="SigLIP + Gemma Value Function Training (Pika HDF5)")
@@ -422,7 +401,6 @@ def main():
     parser.add_argument("--camera_type", type=str, default="fisheye",
                         choices=["fisheye", "depth"])
 
-    # ===== 只新增：resume + tensorboard 频率 =====
     parser.add_argument("--tb_log_interval", type=int, default=50,
                         help="每隔多少 step 写一次 TensorBoard(train step)")
 
