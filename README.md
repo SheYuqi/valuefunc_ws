@@ -52,9 +52,9 @@ python scripts/train.py ... --c_fail 100.0
 ```
 ---
 
-## 评估（eval.py）
+### 3）评估（eval.py）
 
-### 1) 评估
+### 评估
 
 ```bash
 python scripts/eval.py \
@@ -66,7 +66,7 @@ python scripts/eval.py \
 ```
 
 
-### 2) I_t / advantage 相关参数
+### I_t / advantage 相关参数
 
 ```bash
 python scripts/eval.py ... --adv_n 5 --it_percentile 30
