@@ -5,7 +5,7 @@
 
 ## 文件说明
 - `config.py`：全局配置（相机/预处理/默认超参等）
-- `episode.py`：Episode 结构与读写（元信息/帧索引等）
+- `episode.py`：Episode 结构与读写
 - `dataset.py`：Dataset/DataLoader 封装
 - `valuefunc.py`：VF 模型与 value/bin 等工具
 - `split.py`：划分 train/val/test
