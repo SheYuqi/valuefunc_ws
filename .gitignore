@@ -8,6 +8,10 @@ __pycache__/
 
 # Data & checkpoints
 data/
+# allowlist only this episode (逐级放行父目录更稳)
+# !data/clean_bowl/episode_01/**
+# !data/clean_bowl/episode_02/**
+
 datasets/
 checkpoints/
 outputs/
@@ -16,4 +20,3 @@ eval_record/
 
 # Logs
 *.log
-
