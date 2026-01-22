@@ -26,7 +26,7 @@ import matplotlib.font_manager as fm
 
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import PikaHDF5Dataset
+from dataset import HDF5Dataset
 from config import NUM_BINS
 from valuefunc import SigLIPGemmaValueFunction
 from episode import check_dataset_split, split_dataset_episodes, compute_task_max_len_from_path
@@ -133,7 +133,7 @@ def train(args):
     ).to(device)
 
     # dataset / loader
-    train_dataset = PikaHDF5Dataset(
+    train_dataset = HDF5Dataset(
         episode_dirs=train_episodes,
         image_size=args.image_size,
         camera_type=args.camera_type,
@@ -141,7 +141,7 @@ def train(args):
         image_processor=model.image_processor,
         task_max_len=task_max_len,
     )
-    val_dataset = PikaHDF5Dataset(
+    val_dataset = HDF5Dataset(
         episode_dirs=val_episodes,
         image_size=args.image_size,
         camera_type=args.camera_type,
@@ -150,7 +150,7 @@ def train(args):
         task_max_len=task_max_len,
 
     )
-    test_dataset = PikaHDF5Dataset(
+    test_dataset = HDF5Dataset(
         episode_dirs=test_episodes,
         image_size=args.image_size,
         camera_type=args.camera_type,
@@ -473,11 +473,6 @@ def train(args):
     print(f"\n训练完成！best_val_loss={best_val_loss:.4f}, best_val_mae={best_val_mae:.4f}")
     print(f"模型保存至: {output_dir}")
 
-    # （可选）最后做一次 test 评估（不选 best，只汇报）
-    if args.eval_test_at_end:
-        print("\n[Final] 在 Test 集上评估（不用于选模型）...")
-        test_ce, test_top1, test_mae = eval_on_loader(model, test_loader, device, criterion)
-        print(f"[Test] CE={test_ce:.4f}, Top1={test_top1:.4f}, MAE={test_mae:.4f}")
 
 # -----------------------------
 # main
@@ -513,10 +508,6 @@ def main():
     parser.add_argument("--c_fail", type=float, default=50.0, help="失败终止额外惩罚（与数据/评估保持一致）")
     parser.add_argument("--eval_test_at_end", action="store_true", help="训练结束在 test 集汇报一次（不用于选模型）")
 
-    # eval
-    parser.add_argument("--checkpoint", type=str, default="./checkpoints/run_20260113_205201/best_model.pt", help="模型 checkpoint 路径")
-    parser.add_argument("--episode_path", type=str, default="./data/", help="评估 episode 目录路径")
-    parser.add_argument("--save_video", action="store_true", help="生成评估视频")
 
     args = parser.parse_args()
 

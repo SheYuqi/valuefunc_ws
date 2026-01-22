@@ -18,7 +18,7 @@ from config import CAMERA_CONFIGS
 from valuefunc import value_to_bin
 
 
-class PikaHDF5Dataset(Dataset):
+class HDF5Dataset(Dataset):
     """
     episode_dirs: List[Dict]  (推荐) 来自 split_info["train"/"val"/"test"] 的元素
         每个 dict 至少包含：
