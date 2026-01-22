@@ -14,6 +14,40 @@
 
 ---
 
+## 数据格式（目录结构 + instructions.json）
+
+**数据集参考https://huggingface.co/datasets/genrobot2025/10Kh-RealOmin-OpenData/tree/main/Organize_Clutter**
+
+**数据处理参考https://github.com/genrobot-ai/das-datakit**
+
+数据按 **task → episode** 组织；每个 episode 包含 `data.hdf5` 与 `instructions.json`以及 `camera/` 目录(之后可继续添加其他传感器数据)：
+
+```text
+data_dir/
+└── <task_name>/
+    └── episode_xx/
+        ├── camera/              # 相机相关资源（图片格式）
+        ├── data.hdf5            # 主数据（HDF5：图像/状态/动作等，key 以代码为准）
+        └── instructions.json    # 指令/元信息
+````
+
+`instructions.json` 示例（字段说明）：
+
+```json
+{
+  "episode_dir": "/abs/path/to/.../<task_name>/episode_xx",
+  "task_name": "clean_bowl",
+  "prompt": "Clean the bowl.",
+  "success": true
+}
+```
+
+* `episode_dir`：该 episode 的目录路径（用于定位数据文件）
+* `task_name`：任务名（对应 `data_dir/<task_name>/`）
+* `prompt`：语言指令（VF 的文本输入/条件）
+* `success`：该 episode 是否成功（用于监督/评估；失败轨迹可能额外施加 `--c_fail` 惩罚）
+
+
 ## 快速开始
 
 ### 1) 数据集划分
@@ -84,3 +118,4 @@ python scripts/eval.py ... --adv_n 5 --it_percentile 30
 * `--save_video`：生成评估视频
 
 ---
+
