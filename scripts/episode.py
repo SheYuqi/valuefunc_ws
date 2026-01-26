@@ -1,18 +1,23 @@
-import random
-
-# ============================================
-# 加载任务和 episode 工具函数
-# ============================================
 import json
+import random
 from pathlib import Path
-from typing import List, Dict, Optional,Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from collections import defaultdict
-from tqdm import tqdm
-import os
-import h5py
 
-def load_prompt_from_instructions(ep_dir: Path) -> Optional[Dict]:
-    p = ep_dir / "instructions.json"
+
+def _read_jsonl(p: Path) -> List[dict]:
+    out: List[dict] = []
+    if not p.exists():
+        return out
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _safe_read_json(p: Path) -> Optional[dict]:
     if not p.exists():
         return None
     try:
@@ -20,204 +25,352 @@ def load_prompt_from_instructions(ep_dir: Path) -> Optional[Dict]:
     except Exception:
         return None
 
-def norm_relpath(root: Path, p: Path) -> str:
-    return str(p.relative_to(root)).replace("\\", "/")
 
-def scan_episodes(data_dir: str, strict_prompt: bool = True) -> List[Dict]:
-    """
-    扫描 data/*/episode*/data.hdf5
-    返回 episodes: [{episode_dir, prompt, task_name, is_success}]
-    """
-    tasks_root = Path(data_dir)
-    if not tasks_root.exists():
-        raise ValueError(f"找不到 tasks 目录: {tasks_root}（期望 data/...）")
+def _ensure_root_dir(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _is_lerobot_dataset_root(root: Path) -> bool:
+    return (root / "meta" / "episodes.jsonl").exists() and (root / "data").exists()
+
+
+def _find_dataset_roots(data_dir: str) -> List[Path]:
+    root = Path(data_dir)
+    if not root.exists():
+        raise ValueError(f"data_dir 不存在: {root}")
+
+    if _is_lerobot_dataset_root(root):
+        return [root]
+
+    ds: List[Path] = []
+    for d in sorted(root.iterdir()):
+        if d.is_dir() and _is_lerobot_dataset_root(d):
+            ds.append(d)
+
+    if not ds:
+        raise ValueError(f"在 {root} 下未找到 LeRobot 数据集根目录（需要 meta/episodes.jsonl + data/）")
+    return ds
+
+
+def _task_id_to_name(x: Any) -> str:
+    if x is None:
+        return "task-unknown"
+    s = str(x)
+    if s.startswith("task-"):
+        return s
+    try:
+        i = int(s)
+        return f"task-{i:04d}"
+    except Exception:
+        return s
+
+
+def _extract_task_prompt_map(dataset_root: Path) -> Dict[str, str]:
+    task_prompt_map: Dict[str, str] = {}
+    task_file = dataset_root / "meta" / "tasks.jsonl"
+    if not task_file.exists():
+        return task_prompt_map
+
+    for r in _read_jsonl(task_file):
+        tid = r.get("task_name", None)
+        if tid is None:
+            tid = r.get("task_id", r.get("task_index", r.get("id", r.get("name"))))
+        tname = _task_id_to_name(tid)
+
+        txt = r.get(
+            "prompt",
+            r.get("instruction", r.get("description", r.get("language_instruction", r.get("text", "")))),
+        )
+        if isinstance(txt, str) and txt.strip():
+            task_prompt_map[tname] = txt.strip()
+
+    return task_prompt_map
+
+
+def _extract_prompt(ep_rec: dict, task_prompt_map: Dict[str, str], default_prompt: str) -> str:
+    for k in ["prompt", "instruction", "language_instruction", "text", "task_description", "description"]:
+        v = ep_rec.get(k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    tid = ep_rec.get("task_name", None)
+    if tid is None:
+        tid = ep_rec.get("task_id", ep_rec.get("task_index", ep_rec.get("task")))
+    tname = _task_id_to_name(tid)
+
+    txt = task_prompt_map.get(tname, "")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+
+    return default_prompt
+
+
+def _extract_success(ep_rec: dict, default: bool = True) -> bool:
+    for k in ["success", "is_success", "succeeded", "done"]:
+        if k in ep_rec:
+            try:
+                return bool(ep_rec[k])
+            except Exception:
+                break
+    return default
+
+
+def _extract_episode_id(ep_rec: dict, fallback_idx: int) -> str:
+    eid = ep_rec.get("episode_id", ep_rec.get("episode_index", ep_rec.get("id", fallback_idx)))
+    return str(eid)
+
+
+def _extract_episode_relpath(ep_rec: dict) -> Optional[str]:
+    for k in ["episode_path", "path", "file_path", "data_path", "parquet_path", "filename"]:
+        v = ep_rec.get(k, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _load_dataset_episodes(dataset_root: Path) -> List[Dict]:
+    ep_file = dataset_root / "meta" / "episodes.jsonl"
+    ep_recs = _read_jsonl(ep_file)
+    if not ep_recs:
+        raise ValueError(f"{dataset_root} 缺少或空的 episodes.jsonl: {ep_file}")
+
+    task_prompt_map = _extract_task_prompt_map(dataset_root)
+    dataset_name = dataset_root.name
+    default_prompt = dataset_name.replace("_", " ")
 
     episodes: List[Dict] = []
-    h5_list = sorted(tasks_root.glob("*/episode*/data.hdf5"))
-    if not h5_list:
-        raise ValueError(f"未找到任何 episode HDF5: {tasks_root}/<task>/episode*/data.hdf5")
+    for i, r in enumerate(ep_recs):
+        eid = _extract_episode_id(r, i)
 
-    for h5 in h5_list:
-        ep_dir = h5.parent
-        task_dir = ep_dir.parent
-        task_name = task_dir.name
+        tid = r.get("task_name", None)
+        if tid is None:
+            tid = r.get("task_id", r.get("task_index", r.get("task")))
+        task_name = _task_id_to_name(tid) if tid is not None else dataset_name
 
-        instr = load_prompt_from_instructions(ep_dir)
-        if instr is None:
-            if strict_prompt:
-                raise ValueError(f"缺少或无法解析 instructions.json: {ep_dir/'instructions.json'}")
-            else:
-                continue
+        prompt = _extract_prompt(r, task_prompt_map, default_prompt=default_prompt)
+        success = _extract_success(r, default=True)
 
-        prompt = instr.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            if strict_prompt:
-                raise ValueError(f"instructions.json 缺少有效 prompt: {ep_dir/'instructions.json'}")
-            else:
-                continue
-        prompt = prompt.strip()
+        relpath = _extract_episode_relpath(r)
+        abspath = None
+        if relpath is not None:
+            p = dataset_root / relpath
+            if p.exists():
+                abspath = str(p.resolve())
 
-
-        is_success = instr.get("success")
-
-        episodes.append({
-            "episode_dir": str(ep_dir),
-            "prompt": prompt,
-            "task_name": task_name,
-            "success": is_success,
-        })
+        episodes.append(
+            {
+                "dataset_name": dataset_name,
+                "dataset_root": str(dataset_root.resolve()),
+                "episode_id": eid,
+                "task_name": task_name,
+                "prompt": prompt,
+                "success": success,
+                "episode_relpath": relpath,
+                "episode_abspath": abspath,
+                "raw": r,
+            }
+        )
 
     return episodes
 
 
-
-
-# ============================================
-# 数据集划分
-# ============================================
-def relpath_under(root: Path, p: Path) -> str:
-    return str(p.relative_to(root)).replace("\\", "/")
-
-def split_episodes_by_task(all_eps: List[Dict], train_ratio=0.8, val_ratio=0.1, seed=42):
+def _split_by_task(episodes: List[Dict], train_ratio=0.8, val_ratio=0.1, seed=42) -> Dict[str, List[str]]:
     rng = random.Random(seed)
-    by_task = {}
-    for e in all_eps:
-        by_task.setdefault(e["task_name"], []).append(e)
+    by_task: Dict[str, List[Dict]] = defaultdict(list)
+    for e in episodes:
+        by_task[e["task_name"]].append(e)
 
-    train, test, val = [], [], []
-    for task_name, eps in by_task.items():
+    train_ids: List[str] = []
+    val_ids: List[str] = []
+    test_ids: List[str] = []
+
+    for _, eps in by_task.items():
         rng.shuffle(eps)
-        if len(eps) <= 1:
-            train += eps
+        n = len(eps)
+
+        if n <= 2:
+            train_ids.extend([e["episode_id"] for e in eps])
             continue
-        n_train = max(1, int(len(eps) * train_ratio))
-        n_val = max(1, int(len(eps) * val_ratio))
-        train += eps[:n_train]
-        val += eps[n_train:n_train + n_val]
-        test += eps[n_train + n_val:]
 
-    rng.shuffle(train)
-    rng.shuffle(test)
-    rng.shuffle(val)
-    return {"train": train, "test": test, "val": val}
+        n_train = max(1, int(n * train_ratio))
+        n_val = max(1, int(n * val_ratio))
+
+        n_train = min(n_train, n - 1)
+        n_val = min(n_val, n - n_train)
+
+        train_ids.extend([e["episode_id"] for e in eps[:n_train]])
+        val_ids.extend([e["episode_id"] for e in eps[n_train : n_train + n_val]])
+        test_ids.extend([e["episode_id"] for e in eps[n_train + n_val :]])
+
+    rng.shuffle(train_ids)
+    rng.shuffle(val_ids)
+    rng.shuffle(test_ids)
+    return {"train": train_ids, "val": val_ids, "test": test_ids}
 
 
+def _write_dataset_splits_json(
+    dataset_root: Path,
+    split: Dict[str, List[str]],
+    seed: int,
+    train_ratio: float,
+    val_ratio: float,
+) -> Path:
+    _ensure_root_dir(dataset_root)
+    out = {
+        "seed": seed,
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "train": split["train"],
+        "val": split["val"],
+        "test": split.get("test", []),
+    }
+    p = dataset_root / "splits.json"
+    p.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return p
 
-def find_all_episodes(data_dir: str) -> List[str]:
-    """查找所有 episode 目录"""
-    data_path = Path(data_dir)
-    episode_dirs = []
-    
-    # 查找所有包含 data.hdf5 的 episode* 目录
-    for d in sorted(data_path.iterdir()):
-        if d.is_dir() and d.name.startswith("episode"):
-            hdf5_path = d / "data.hdf5"
-            if hdf5_path.exists():
-                episode_dirs.append(str(d))
-    
-    return episode_dirs
+
+def _combine_splits_for_pack(
+    pack_root: Path,
+    per_dataset_splits: Dict[str, Dict[str, List[str]]],
+    seed: int,
+    train_ratio: float,
+    val_ratio: float,
+) -> Dict:
+    def _prefix(ds: str, ids: List[str]) -> List[str]:
+        return [f"{ds}/{eid}" for eid in ids]
+
+    train: List[str] = []
+    val: List[str] = []
+    test: List[str] = []
+
+    for ds_name, sp in per_dataset_splits.items():
+        train.extend(_prefix(ds_name, sp.get("train", [])))
+        val.extend(_prefix(ds_name, sp.get("val", [])))
+        test.extend(_prefix(ds_name, sp.get("test", [])))
+
+    out = {
+        "seed": seed,
+        "train_ratio": train_ratio,
+        "val_ratio": val_ratio,
+        "train": train,
+        "val": val,
+        "test": test,
+        "datasets": sorted(list(per_dataset_splits.keys())),
+    }
+
+    _ensure_root_dir(pack_root)
+    (pack_root / "splits.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+    return out
 
 
 def check_dataset_split(data_dir: str) -> Tuple[bool, Optional[Dict]]:
+    roots = _find_dataset_roots(data_dir)
     data_path = Path(data_dir)
-    split_file = data_path / "split_info.txt"
-    if not split_file.exists():
+
+    if len(roots) == 1 and data_path.resolve() == roots[0].resolve():
+        split_json = roots[0] / "splits.json"
+        split = _safe_read_json(split_json)
+        if not split:
+            return False, None
+        ok = (len(split.get("train", [])) > 0) and (len(split.get("val", [])) > 0)
+        if ok:
+            print(f"[LeRobot] 数据集已划分: {split_json} | train={len(split['train'])}, val={len(split['val'])}, test={len(split.get('test', []))}")
+            return True, split
         return False, None
 
-    split_rel = {"train": [], "test": [],"val": []}
-    current = None
-    for line in split_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line in ["[train]", "[test]", "[val]"]:
-            current = line[1:-1]
-            continue
-        if not line or current is None:
-            continue
-        split_rel[current].append(line)
+    per_ds: Dict[str, Dict[str, List[str]]] = {}
+    seed = 42
+    train_ratio = 0.8
+    val_ratio = 0.1
+    first = True
 
-    if len(split_rel["train"]) == 0:
-        return False, None
+    for r in roots:
+        split_json = r / "splits.json"
+        split = _safe_read_json(split_json)
+        if not split or len(split.get("train", [])) == 0 or len(split.get("val", [])) == 0:
+            return False, None
 
-    all_eps = scan_episodes(str(data_path))  # data_dir
-    index = {relpath_under(data_path, Path(e["episode_dir"])): e for e in all_eps}
+        per_ds[r.name] = {"train": split["train"], "val": split["val"], "test": split.get("test", [])}
 
-    split = {"train": [], "test": [], "val": []}
-    for sp in ["train", "test", "val"]:
-        for rel in split_rel[sp]:
-            if rel in index:
-                split[sp].append(index[rel])
-            else:
-                print(f"警告: split 中的 {rel} 不在扫描结果里，已跳过")
+        if first:
+            seed = int(split.get("seed", seed))
+            train_ratio = float(split.get("train_ratio", train_ratio))
+            val_ratio = float(split.get("val_ratio", val_ratio))
+            first = False
 
-    print(f"数据集已划分: train={len(split['train'])}, test={len(split['test'])}, val={len(split['val'])}")
-    return True, split
-
-
+    combined = _combine_splits_for_pack(
+        pack_root=Path(data_dir),
+        per_dataset_splits=per_ds,
+        seed=seed,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    print(f"[LeRobot-Pack] 已划分: datasets={len(per_ds)}, train={len(combined['train'])}, val={len(combined['val'])}, test={len(combined.get('test', []))}")
+    return True, combined
 
 
 def split_dataset_episodes(
     data_dir: str,
     train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
     seed: int = 42,
     force: bool = False,
-) -> Dict[str, List[Dict]]:
+) -> Dict:
+    roots = _find_dataset_roots(data_dir)
     data_path = Path(data_dir)
-    is_split, split_info = check_dataset_split(data_dir)
-    if not force and is_split:
-        print("数据集已经划分好，使用现有划分")
-        return split_info
 
-    all_eps = scan_episodes(str(data_path))
+    if len(roots) == 1 and data_path.resolve() == roots[0].resolve():
+        split_json = roots[0] / "splits.json"
+        if (not force) and split_json.exists():
+            split = _safe_read_json(split_json)
+            if split and len(split.get("train", [])) > 0 and len(split.get("val", [])) > 0:
+                print(f"[LeRobot] splits.json 已存在，直接使用: {split_json}")
+                return split
 
-    print(f"共找到 {len(all_eps)} 个 episode (跨任务)")
+        episodes = _load_dataset_episodes(roots[0])
+        split = _split_by_task(episodes, train_ratio=train_ratio, val_ratio=val_ratio, seed=seed)
+        out_path = _write_dataset_splits_json(roots[0], split, seed=seed, train_ratio=train_ratio, val_ratio=val_ratio)
+        print(f"[LeRobot] 写入 splits.json: {out_path} | train={len(split['train'])}, val={len(split['val'])}, test={len(split.get('test', []))}")
+        return _safe_read_json(out_path) or {}
 
-    split = split_episodes_by_task(all_eps, train_ratio=train_ratio, seed=seed)
+    per_ds_splits: Dict[str, Dict[str, List[str]]] = {}
+    for r in roots:
+        split_json = r / "splits.json"
+        if (not force) and split_json.exists():
+            split = _safe_read_json(split_json)
+            if split and len(split.get("train", [])) > 0 and len(split.get("val", [])) > 0:
+                per_ds_splits[r.name] = {"train": split["train"], "val": split["val"], "test": split.get("test", [])}
+                continue
 
-    split_file = data_path / "split_info.txt"
-    with split_file.open("w", encoding="utf-8") as f:
-        for sp in ["train", "test", "val"]:
-            f.write(f"[{sp}]\n")
-            for e in split[sp]:
-                rel = relpath_under(data_path, Path(e["episode_dir"]))
-                f.write(rel + "\n")
-            f.write("\n")
+        episodes = _load_dataset_episodes(r)
+        sp = _split_by_task(episodes, train_ratio=train_ratio, val_ratio=val_ratio, seed=seed)
+        _write_dataset_splits_json(r, sp, seed=seed, train_ratio=train_ratio, val_ratio=val_ratio)
+        per_ds_splits[r.name] = sp
 
-    print(f"划分结果: train={len(split['train'])}, test={len(split['test'])}, val={len(split['val'])}")
-    print(f"划分信息已保存到: {split_file}")
-    return split
-
-
-def compute_task_max_len_from_path(episodes: List[Dict], desc="统计 task max_len") -> Dict[str, int]:
-    task2max = defaultdict(int)
-    for ep in tqdm(episodes, desc=desc):
-        episode_dir = ep["episode_dir"]
-        task_key = Path(episode_dir).parent.name
-        # print("task_key:",task_key)
-        hdf5_path = os.path.join(episode_dir, "data.hdf5")
-        if not os.path.exists(hdf5_path):
-            continue
-        try:
-            with h5py.File(hdf5_path, "r") as f:
-                L = int(f["size"][()])
-            if L > task2max[task_key]:
-                task2max[task_key] = L
-        except Exception:
-            continue
-    return dict(task2max)
+    combined = _combine_splits_for_pack(
+        pack_root=data_path,
+        per_dataset_splits=per_ds_splits,
+        seed=seed,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    print(f"[LeRobot-Pack] 写入合并 splits: {data_path/'splits.json'} | datasets={len(per_ds_splits)}, train={len(combined['train'])}, val={len(combined['val'])}, test={len(combined.get('test', []))}")
+    return combined
 
 
-def get_task_max_len(data_root: str, task_name: str) -> int:
-    task_dir = Path(data_root) / task_name
-    max_len = 0
-    for ep_dir in task_dir.glob("episode_*"):
-        hdf5_path = ep_dir / "data.hdf5"
-        if not hdf5_path.exists():
-            continue
-        try:
-            with h5py.File(hdf5_path, "r") as f:
-                L = int(f["size"][()])
-            if L > max_len:
-                max_len = L
-        except Exception:
-            continue
-    return max_len
+def split_dataset_to_folders(
+    data_dir: str,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    force: bool = False,
+):
+    print(f"[Split] Creating split under: {data_dir} (seed={seed})")
+    return split_dataset_episodes(
+        data_dir=data_dir,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+        force=force,
+    )

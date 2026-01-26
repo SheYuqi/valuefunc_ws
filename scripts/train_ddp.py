@@ -42,7 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 # =========================
 # 你仓库里的依赖
 # =========================
-from dataset import HDF5Dataset
+from genrobot.scripts.hdf5_dataset import HDF5Dataset
 from config import NUM_BINS
 from valuefunc import SigLIPGemmaValueFunction
 from episode import check_dataset_split, split_dataset_episodes, compute_task_max_len_from_path

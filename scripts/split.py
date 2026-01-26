@@ -12,12 +12,12 @@ def _print_split(split_info: dict):
     print(f"train: {len(train)} episodes")
     print(f"val  : {len(val)} episodes")
     print(f"test : {len(test)} episodes")
-    if len(train) > 0:
-        print(f"train example: {train[0]}")
-    if len(val) > 0:
-        print(f"val   example: {val[0]}")
-    if len(test) > 0:
-        print(f"test  example: {test[0]}")
+    # if len(train) > 0:
+    #     print(f"train example: {train[0]}")
+    # if len(val) > 0:
+    #     print(f"val   example: {val[0]}")
+    # if len(test) > 0:
+    #     print(f"test  example: {test[0]}")
 
 
 def main():
