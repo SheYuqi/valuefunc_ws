@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Evaluate SigLIP+Gemma Value Function on ONE LeRobot v2.1 episode.
-- Only evaluates the specified episode (--episode_id or --episode_index).
-- Computes Advantage (n-step) and I_t, and visualizes them.
-- Saves a PNG (value + true value + advantage + I_t strip) and optional MP4.
-"""
-
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -31,11 +24,10 @@ from lerobot_dataset import LeRobotV21SigLIPDataset
 
 
 META_KEY_CANDIDATES = {
-    "episode_id": ["episode_id", "episode", "traj_id", "trajectory_id", "demo_id", "episode_name"],
-    "step": ["t", "step", "frame", "index_in_episode", "step_idx", "time_idx"],
-    "episode_len": ["episode_len", "T", "horizon", "traj_len", "trajectory_len", "len"],
-    "success": ["success", "is_success", "done_success", "episode_success"],
-    "task_name": ["task_name", "task", "task_id", "task_key", "env"],
+    "episode_id": ["episode_index"],
+    "step": ["frame_index", "frame_idx"],
+    "episode_len": ["episode_len"],
+    "success": ["success"],
 }
 
 
@@ -69,6 +61,13 @@ def meta_step(meta: Any) -> Optional[int]:
         return None
 
 
+def sample_meta(sample: Dict[str, Any]) -> Dict[str, Any]:
+    meta = sample.get("meta", None)
+    if isinstance(meta, dict):
+        return meta
+    return sample
+
+
 def meta_success(meta: Any) -> Optional[bool]:
     v = meta_get(meta, META_KEY_CANDIDATES["success"], None)
     if v is None:
@@ -80,13 +79,6 @@ def meta_success(meta: Any) -> Optional[bool]:
     if isinstance(v, str):
         return v.strip().lower() in ["1", "true", "yes", "y"]
     return None
-
-
-def meta_task_name(meta: Any, prompt: str) -> str:
-    v = meta_get(meta, META_KEY_CANDIDATES["task_name"], None)
-    if v is not None:
-        return str(v)
-    return f"task_{abs(hash(prompt)) % 100000}"
 
 
 def load_checkpoint(path: str, device: torch.device) -> Dict[str, Any]:
@@ -151,34 +143,64 @@ def eval_one_episode(args):
     )
     print(f"[Dataset] split={args.split} len={len(ds)}")
 
-    if args.episode_id is None and args.episode_index is None:
-        raise ValueError("Must provide --episode_id or --episode_index")
+    if args.episode_id is None:
+        raise ValueError("Must provide --episode_id")
 
     indices: List[int] = []
-    if args.episode_id is not None:
-        target_id = str(args.episode_id)
-        for i in range(len(ds)):
-            meta = ds[i].get("meta", None)
-            if meta_episode_id(meta) == target_id:
-                indices.append(i)
-    else:
-        target_idx = int(args.episode_index)
-        order: List[str] = []
-        for i in range(len(ds)):
-            meta = ds[i].get("meta", None)
-            eid = meta_episode_id(meta)
-            if eid is None:
+    target_id = str(args.episode_id)
+
+    # Fast path: use episodes.jsonl lengths + dataset episode ordering (no frame decoding)
+    used_fast = False
+    if hasattr(ds, "_subs"):
+        for sub in ds._subs:
+            episodes = getattr(sub.ds, "episodes", None)
+            if not episodes:
                 continue
-            if eid not in order:
-                order.append(eid)
-            if (len(order) - 1) == target_idx:
-                indices.append(i)
-            elif len(order) - 1 > target_idx and indices:
+            episodes = list(episodes)
+            for ep_idx in episodes:
+                if str(ep_idx) == target_id:
+                    length = 0
+                    if ep_idx in sub.prompt_len_map:
+                        try:
+                            length = int(sub.prompt_len_map[ep_idx][1])
+                        except Exception:
+                            length = 0
+                    if length > 0:
+                        start_in_sub = 0
+                        ok = True
+                        for ep_prev in episodes:
+                            if ep_prev == ep_idx:
+                                break
+                            if ep_prev in sub.prompt_len_map:
+                                try:
+                                    start_in_sub += int(sub.prompt_len_map[ep_prev][1])
+                                except Exception:
+                                    ok = False
+                                    break
+                            else:
+                                ok = False
+                                break
+                        if ok:
+                            sub_len = len(sub.ds)
+                            sub_start = sub.cum_len - sub_len
+                            start = sub_start + start_in_sub
+                            indices = list(range(start, start + length))
+                            used_fast = True
+                    break
+            if used_fast:
                 break
 
+    # Slow fallback: scan dataset by episode_id from sample/meta
     if not indices:
-        raise RuntimeError("No samples found for this episode. Check meta episode_id fields.")
+        for i in range(len(ds)):
+            sample = ds[i]
+            meta = sample_meta(sample)
+            eid = meta_episode_id(meta)
+            if eid == target_id:
+                indices.append(i)
 
+    if not indices:
+        raise RuntimeError("No samples found for this episode. Check meta episode_id fields or episodes.jsonl length.")
     def _step(i: int) -> int:
         s = meta_step(ds[i].get("meta", None))
         return s if s is not None else 10**18
@@ -203,15 +225,15 @@ def eval_one_episode(args):
 
     for idx in indices:
         sample = ds[idx]
-        meta = sample.get("meta", None)
+        meta = sample_meta(sample)
         metas.append(meta)
 
         prompt = sample["prompt"]
         prompts.append(prompt)
 
-        head = sample["image"].to(device).unsqueeze(0)
-        left = sample["wrist_image"].to(device).unsqueeze(0)
-        right = sample["third_image"].to(device).unsqueeze(0)
+        head = sample["head_image"].to(device).unsqueeze(0)
+        left = sample["left_image"].to(device).unsqueeze(0)
+        right = sample["right_image"].to(device).unsqueeze(0)
 
         with autocast_ctx(device, args.amp and device.type == "cuda"):
             logits, v = model(head, left, right, [prompt])
@@ -225,9 +247,9 @@ def eval_one_episode(args):
         true_values.append(tv)
         true_bins.append(tb)
 
-        head_imgs.append(to_uint8_rgb(sample["image"], model.image_processor))
-        left_imgs.append(to_uint8_rgb(sample["wrist_image"], model.image_processor))
-        right_imgs.append(to_uint8_rgb(sample["third_image"], model.image_processor))
+        head_imgs.append(to_uint8_rgb(sample["head_image"], model.image_processor))
+        left_imgs.append(to_uint8_rgb(sample["left_image"], model.image_processor))
+        right_imgs.append(to_uint8_rgb(sample["right_image"], model.image_processor))
 
     pred_values_np = np.asarray(pred_values, dtype=np.float32)
     pred_bins_np = np.asarray(pred_bins, dtype=np.int64)
@@ -239,9 +261,10 @@ def eval_one_episode(args):
 
     prompt0 = prompts[0]
     meta0 = metas[0] if metas else None
-    eid = meta_episode_id(meta0) or (args.episode_id or f"episode_{args.episode_index}")
+    eid = target_id
     is_success = meta_success(meta0)
-    task_name = meta_task_name(meta0, prompt0)
+    dataset_name = meta_get(meta0, ["dataset_name"], "dataset")
+    task_name = f"{dataset_name}_{args.split}_episode_{eid}"
 
     if args.denom is not None:
         denom = float(args.denom)
@@ -280,12 +303,9 @@ def eval_one_episode(args):
     print(f"task_name : {task_name}")
     print(f"success   : {status_text}")
     print(f"len       : {L} (stride={stride})")
-    print(f"prompt    : {prompt0}")
-    print(f"denom     : {denom:.3f} (adv reward scale)")
     print(f"MAE       : {mae:.4f}")
     print(f"Bin Acc   : {acc:.4f}")
     print(f"Corr      : {corr:.4f}")
-    print(f"Adv(n={N}) eps(p{it_percentile:.0f})={eps:.6f}, I_t True rate={it_rate:.3f}")
     print("=================================\n")
 
     out_dir = Path(args.out_dir)
@@ -472,8 +492,7 @@ def main():
     p.add_argument("--cam_left_key", type=str, default="observation.images.cam_left_wrist_rgb")
     p.add_argument("--cam_right_key", type=str, default="observation.images.cam_right_wrist_rgb")
 
-    p.add_argument("--episode_id", type=str, default=None, help="episode id (requires meta)")
-    p.add_argument("--episode_index", type=int, default=None, help="episode order index (requires meta)")
+    p.add_argument("--episode_id", type=str, required=True, help="episode id/index from dataset meta")
 
     p.add_argument("--adv_n", type=int, default=50)
     p.add_argument("--it_percentile", type=float, default=30.0)

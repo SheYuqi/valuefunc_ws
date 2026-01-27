@@ -12,16 +12,10 @@ def _print_split(split_info: dict):
     print(f"train: {len(train)} episodes")
     print(f"val  : {len(val)} episodes")
     print(f"test : {len(test)} episodes")
-    # if len(train) > 0:
-    #     print(f"train example: {train[0]}")
-    # if len(val) > 0:
-    #     print(f"val   example: {val[0]}")
-    # if len(test) > 0:
-    #     print(f"test  example: {test[0]}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Split Pika HDF5 episodes into train/val/test")
+    parser = argparse.ArgumentParser(description="Split Lerobot episodes into train/val/test")
     parser.add_argument("--data_dir", type=str, default="data", help="数据根目录（包含各任务子目录）")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--force", action="store_true", help="即使已经存在 split 也强制重新划分")
