@@ -44,11 +44,11 @@ def save_torch(state: Dict[str, Any], path: Path):
 
 def collate_fn_three_cam(batch):
     # LeRobotV21SigLIPDataset returns:
-    #   image, wrist_image, third_image, prompt, value_target, value_bin
+    #   head_image, left_image, right_image, prompt, value_target, value_bin
     return {
-        "head_image": torch.stack([b["image"] for b in batch], dim=0),
-        "left_image": torch.stack([b["wrist_image"] for b in batch], dim=0),
-        "right_image": torch.stack([b["third_image"] for b in batch], dim=0),
+        "head_image": torch.stack([b["head_image"] for b in batch], dim=0),
+        "left_image": torch.stack([b["left_image"] for b in batch], dim=0),
+        "right_image": torch.stack([b["right_image"] for b in batch], dim=0),
         "prompt": [b["prompt"] for b in batch],
         "value_target": torch.stack([b["value_target"] for b in batch], dim=0),
         "value_bin": torch.stack([b["value_bin"] for b in batch], dim=0),
@@ -182,8 +182,8 @@ def train(args):
     # Quick sanity
     x0 = train_dataset[0]
     print(
-        f"[Sanity] head={tuple(x0['image'].shape)} left={tuple(x0['wrist_image'].shape)} "
-        f"right={tuple(x0['third_image'].shape)} prompt='{x0['prompt'][:80]}'"
+        f"[Sanity] head={tuple(x0['head_image'].shape)} left={tuple(x0['left_image'].shape)} "
+        f"right={tuple(x0['right_image'].shape)} prompt='{x0['prompt'][:80]}'"
     )
 
     for epoch in range(args.num_epochs):
