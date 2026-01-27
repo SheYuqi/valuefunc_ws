@@ -104,6 +104,15 @@ python scripts/eval.py \
 
 ```bash
 python scripts/eval.py ... --adv_n 5 --it_percentile 30
+
+python eval.py \
+  --data_dir /home/ubuntu/Sheyuqi/data/data \
+  --ckpt checkpoints/run_20260127_112753/best_model.pt \
+  --batch_size 8 \
+  --num_workers 4 \
+  --amp \
+  --no_lm_head
+
 ```
 
 ---
@@ -119,3 +128,26 @@ python scripts/eval.py ... --adv_n 5 --it_percentile 30
 
 ---
 
+python eval_lerobot.py \
+  --data_dir /home/ubuntu/Sheyuqi/data/data \
+  --ckpt checkpoints/run_20260127_112753/best_model.pt \
+  --split val \
+  --out_dir /path/to/checkpoints/eval_vis \
+  --save_video \
+  --video_fps 20 \
+  --adv_n 50 \
+  --it_percentile 30 \
+  --no_lm_head \
+  --amp
+
+python eval_single_lerobot.py \
+  --data_dir /home/ubuntu/Sheyuqi/data/data \
+  --ckpt checkpoints/run_20260127_112753/best_model.pt \
+  --split val \
+  --episode_id 000000 \
+  --out_dir checkpoints/run_20260127_112753/ \
+  --adv_n 50 \
+  --it_percentile 30 \
+  --save_video \
+  --video_fps 20 \
+  --amp

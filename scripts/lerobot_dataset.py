@@ -32,8 +32,6 @@ except Exception:
 
 
 # ----------------------------
-# Helpers
-# ----------------------------
 def _read_json(p: Path) -> Optional[dict]:
     if not p.exists():
         return None
@@ -79,13 +77,6 @@ def _find_dataset_roots(data_dir: str) -> List[Path]:
 
 
 def _parse_episode_id(x: Any) -> int:
-    """
-    splits.json 里可能是:
-      - 12
-      - "12"
-      - "episode_000012"
-      - "R1_Lite_make_tea/12"
-    """
     if isinstance(x, int):
         return int(x)
     s = str(x)
@@ -98,11 +89,7 @@ def _parse_episode_id(x: Any) -> int:
 
 
 def _load_prompt_len_map(dataset_root: Path) -> Dict[int, Tuple[str, int, bool]]:
-    """
-    你的 episodes.jsonl schema 示例:
-      {"episode_index": 0, "tasks": [...], "length": 636}
-    这里我们只用它来提供 prompt/length/success（不用于路径/视频解码）
-    """
+
     ep_file = dataset_root / "meta" / "episodes.jsonl"
     recs = _read_jsonl(ep_file)
     mp: Dict[int, Tuple[str, int, bool]] = {}
@@ -148,12 +135,7 @@ def _load_prompt_len_map(dataset_root: Path) -> Dict[int, Tuple[str, int, bool]]
 
 
 def _tensor_to_pil(img: torch.Tensor) -> Image.Image:
-    """
-    LeRobotDataset 通常返回 torch.Tensor:
-      - [C,H,W] 或 [T,C,H,W]
-      - dtype 可能是 uint8 或 float
-    这里统一转为 PIL(RGB)
-    """
+
     if img.ndim == 4:
         # delta_timestamps 可能返回 [T,C,H,W]，我们取当前帧（通常 T=1）
         img = img[-1]

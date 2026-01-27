@@ -80,7 +80,7 @@ class SigLIPGemmaValueFunction(nn.Module):
         
         print("=" * 60)
         print("初始化 SigLIP + Gemma Value Function")
-        print("输入: 左右两张图像 + prompt")
+        print("输入: 头顶+左右手三张图像 + prompt")
         print("=" * 60)
         
         # ==================== SigLIP 视觉编码器 ====================
@@ -107,8 +107,8 @@ class SigLIPGemmaValueFunction(nn.Module):
         print(f"文本投影: {self.text_dim} -> {hidden_dim}")
         
         # ==================== 融合层 ====================
-        # 2张图像 + 文本 = 3 * hidden_dim
-        fusion_input_dim = 3 * hidden_dim
+        # 3张图像 + 文本 = 4 * hidden_dim
+        fusion_input_dim = 4 * hidden_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden_dim * 2),
             nn.LayerNorm(hidden_dim * 2),
@@ -257,6 +257,7 @@ class SigLIPGemmaValueFunction(nn.Module):
         self,
         left_image: torch.Tensor,
         right_image: torch.Tensor,
+        head_image: torch.Tensor,
         prompts: List[str],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -274,10 +275,13 @@ class SigLIPGemmaValueFunction(nn.Module):
         # 编码两张图像
         left_features = self._encode_images(left_image)     # [batch, vision_dim]
         right_features = self._encode_images(right_image)   # [batch, vision_dim]
+        head_features = self._encode_images(head_image)     # [batch, vision_dim]
+
         
         # 投影视觉特征
         left_proj = self.vision_proj(left_features)         # [batch, hidden_dim]
         right_proj = self.vision_proj(right_features)       # [batch, hidden_dim]
+        head_proj = self.vision_proj(head_features)         # [batch, hidden_dim]
         
         # 编码文本
         text_features = self._encode_text(prompts, device)  # [batch, text_dim]
@@ -287,8 +291,9 @@ class SigLIPGemmaValueFunction(nn.Module):
         combined = torch.cat([
             left_proj,
             right_proj,
+            head_proj,
             text_proj,
-        ], dim=-1)  # [batch, 3 * hidden_dim]
+        ], dim=-1)  # [batch, 4 * hidden_dim]
         fused = self.fusion(combined)  # [batch, hidden_dim]
         # Value Head
         logits = self.value_head(fused)  # [batch, num_bins]
