@@ -1,41 +1,22 @@
 #!/usr/bin/env python3
-# ============================================================
-# eval_single_lerobot.py
-# Evaluate SigLIP+Gemma Value Function on ONE LeRobot v2.1 episode
-# - Input: LeRobot pack root (--data_dir) + one episode (--episode_id or --episode_index)
-# - Outputs:
-#   1) PNG: Value + TrueValue + Advantage + eps + I_t strip
-#   2) MP4 (optional): 3-camera frames + curves + cursor + per-frame token/I_t/V/A
-# - Computes:
-#   - MAE / Bin Acc / Corr (pred vs true)
-#   - Advantage (n-step): sum r + V_{t+N} - V_t
-#   - I_t = (Advantage > eps), eps = percentile(pred_values, it_percentile)
-#
-# Requirements:
-# - LeRobotV21SigLIPDataset must support return_meta=True and provide meta with:
-#     episode_id (or similar), step index t (or similar), optionally success flag.
-#   If your meta keys differ, edit META_KEY_CANDIDATES below.
-#
-# Notes:
-# - Advantage needs per-step reward r_norm. We derive denom from true_values slope by default.
-#   You can override with --denom.
-# - If you want failure penalty, meta should include success flag; else success=Unknown => terminal reward 0.
-# ============================================================
+"""
+Evaluate SigLIP+Gemma Value Function on ONE LeRobot v2.1 episode.
+- Only evaluates the specified episode (--episode_id or --episode_index).
+- Computes Advantage (n-step) and I_t, and visualizes them.
+- Saves a PNG (value + true value + advantage + I_t strip) and optional MP4.
+"""
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from tqdm import tqdm
-
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Glyph.*missing from font.*")
 
 import matplotlib
@@ -49,9 +30,6 @@ from valuefunc import SigLIPGemmaValueFunction
 from lerobot_dataset import LeRobotV21SigLIPDataset
 
 
-# -----------------------------
-# Meta key candidates (edit if needed)
-# -----------------------------
 META_KEY_CANDIDATES = {
     "episode_id": ["episode_id", "episode", "traj_id", "trajectory_id", "demo_id", "episode_name"],
     "step": ["t", "step", "frame", "index_in_episode", "step_idx", "time_idx"],
@@ -61,9 +39,6 @@ META_KEY_CANDIDATES = {
 }
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def autocast_ctx(device: torch.device, use_amp: bool):
     if not use_amp:
         return torch.autocast(device_type="cpu", enabled=False)
@@ -139,31 +114,21 @@ def infer_model_kwargs_from_ckpt(ckpt: Dict[str, Any], args) -> Dict[str, Any]:
 
 
 def to_uint8_rgb(img_chw: torch.Tensor, image_processor=None) -> np.ndarray:
-    """
-    img_chw: [3,H,W], float tensor (likely normalized)
-    return: HxWx3 uint8 RGB
-    """
     x = img_chw.detach().float().cpu()
-
     if image_processor is not None and hasattr(image_processor, "image_mean") and hasattr(image_processor, "image_std"):
         mean = torch.tensor(image_processor.image_mean).view(3, 1, 1)
         std = torch.tensor(image_processor.image_std).view(3, 1, 1)
         x = x * std + mean
-
     x = x.clamp(0, 1)
     x = (x * 255.0).byte()
-    return x.permute(1, 2, 0).numpy()  # HWC RGB
+    return x.permute(1, 2, 0).numpy()
 
 
-# -----------------------------
-# Main episode eval
-# -----------------------------
 @torch.no_grad()
 def eval_one_episode(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"[Device] {device}")
 
-    # ----- load ckpt + build model -----
     ckpt = load_checkpoint(args.ckpt, device)
     model_kwargs = infer_model_kwargs_from_ckpt(ckpt, args)
 
@@ -171,7 +136,6 @@ def eval_one_episode(args):
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
     model.eval()
 
-    # ----- dataset -----
     camera_keys = [args.cam_head_key, args.cam_left_key, args.cam_right_key]
     ds = LeRobotV21SigLIPDataset(
         data_dir=args.data_dir,
@@ -180,30 +144,27 @@ def eval_one_episode(args):
         image_processor=model.image_processor,
         c_fail=args.c_fail,
         return_value=True,
-        return_meta=True,   # needed
+        return_meta=True,
         video_backend="pyav",
         delta_timestamps=None,
         strict_split=True,
     )
     print(f"[Dataset] split={args.split} len={len(ds)}")
 
-    # ----- collect episode indices -----
     if args.episode_id is None and args.episode_index is None:
         raise ValueError("Must provide --episode_id or --episode_index")
 
     indices: List[int] = []
     if args.episode_id is not None:
         target_id = str(args.episode_id)
-        for i in tqdm(range(len(ds)), desc="Scan dataset", leave=False):
+        for i in range(len(ds)):
             meta = ds[i].get("meta", None)
-            eid = meta_episode_id(meta)
-            if eid == target_id:
+            if meta_episode_id(meta) == target_id:
                 indices.append(i)
     else:
-        # episode_index: based on first-seen episode_id order
         target_idx = int(args.episode_index)
         order: List[str] = []
-        for i in tqdm(range(len(ds)), desc="Scan dataset", leave=False):
+        for i in range(len(ds)):
             meta = ds[i].get("meta", None)
             eid = meta_episode_id(meta)
             if eid is None:
@@ -212,27 +173,23 @@ def eval_one_episode(args):
                 order.append(eid)
             if (len(order) - 1) == target_idx:
                 indices.append(i)
-            elif len(order) - 1 > target_idx and len(indices) > 0:
-                # finished collecting that episode
+            elif len(order) - 1 > target_idx and indices:
                 break
 
-    if len(indices) == 0:
-        raise RuntimeError("No samples found for this episode. Check return_meta=True and meta episode_id fields.")
+    if not indices:
+        raise RuntimeError("No samples found for this episode. Check meta episode_id fields.")
 
-    # sort by step index if possible
-    def _step(i):
+    def _step(i: int) -> int:
         s = meta_step(ds[i].get("meta", None))
         return s if s is not None else 10**18
 
     indices.sort(key=_step)
 
-    # apply stride and max_steps
     stride = max(1, int(args.video_stride))
     if args.max_steps is not None:
         indices = indices[: int(args.max_steps)]
     indices = indices[::stride]
 
-    # ----- forward per-step -----
     head_imgs: List[np.ndarray] = []
     left_imgs: List[np.ndarray] = []
     right_imgs: List[np.ndarray] = []
@@ -244,7 +201,7 @@ def eval_one_episode(args):
     prompts: List[str] = []
     metas: List[Any] = []
 
-    for idx in tqdm(indices, desc="Forward episode", leave=False):
+    for idx in indices:
         sample = ds[idx]
         meta = sample.get("meta", None)
         metas.append(meta)
@@ -281,26 +238,21 @@ def eval_one_episode(args):
     frames = np.arange(L)
 
     prompt0 = prompts[0]
-    meta0 = metas[0] if len(metas) else None
+    meta0 = metas[0] if metas else None
     eid = meta_episode_id(meta0) or (args.episode_id or f"episode_{args.episode_index}")
     is_success = meta_success(meta0)
     task_name = meta_task_name(meta0, prompt0)
 
-    # ----- denom for advantage reward -----
     if args.denom is not None:
         denom = float(args.denom)
     else:
-        # estimate from true_values slope: V(t+1)-V(t) ~= 1/denom
         deltas = true_values_np[1:] - true_values_np[:-1]
         deltas = deltas[(deltas > 1e-6) & np.isfinite(deltas)]
         denom = float(1.0 / np.median(deltas)) if len(deltas) > 0 else float(max(1, L - 1))
     denom = max(1.0, denom)
 
-    # ----- compute advantage & I_t -----
     N = max(1, int(args.adv_n))
     r_norm = np.full((L,), -1.0 / float(denom), dtype=np.float32)
-
-    # terminal reward (if success known)
     if is_success is None:
         r_norm[-1] = 0.0
     else:
@@ -310,14 +262,13 @@ def eval_one_episode(args):
     adv = np.zeros((L,), dtype=np.float32)
     for i in range(L):
         n = min(N, L - i)
-        adv[i] = float(r_norm[i:i+n].sum() + V_pad[i+n] - V_pad[i])
+        adv[i] = float(r_norm[i:i + n].sum() + V_pad[i + n] - V_pad[i])
 
     it_percentile = max(0.0, min(100.0, float(args.it_percentile)))
     eps = float(np.percentile(pred_values_np, it_percentile))
     It = adv > eps
     adv_token = np.where(It, "Advantage: positive", "Advantage: negative")
 
-    # ----- metrics -----
     mae = float(np.mean(np.abs(pred_values_np - true_values_np)))
     acc = float(np.mean(pred_bins_np == true_bins_np))
     corr = float(np.corrcoef(pred_values_np, true_values_np)[0, 1]) if L > 1 else 0.0
@@ -340,7 +291,6 @@ def eval_one_episode(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----- save plot png -----
     fig, ax = plt.subplots(1, 1, figsize=(12, 5))
     ax.plot(frames, pred_values_np, "r-", label="Pred Value", linewidth=2)
     ax.plot(frames, true_values_np, "g--", label="True Value", linewidth=2)
@@ -369,7 +319,6 @@ def eval_one_episode(args):
     plt.close()
     print(f"[Saved] plot: {plot_path}")
 
-    # ----- optional mp4 -----
     if args.save_video:
         video_path = out_dir / f"{task_name}_{eid}.mp4"
         print(f"[Video] generating: {video_path}")
@@ -382,9 +331,15 @@ def eval_one_episode(args):
         ax_right = fig.add_subplot(gs[2, 0])
         ax_value = fig.add_subplot(gs[:, 1])
 
-        im_head = ax_head.imshow(head_imgs[0]); ax_head.set_title("Head"); ax_head.axis("off")
-        im_left = ax_left.imshow(left_imgs[0]); ax_left.set_title("Left wrist"); ax_left.axis("off")
-        im_right = ax_right.imshow(right_imgs[0]); ax_right.set_title("Right wrist"); ax_right.axis("off")
+        im_head = ax_head.imshow(head_imgs[0])
+        ax_head.set_title("Head")
+        ax_head.axis("off")
+        im_left = ax_left.imshow(left_imgs[0])
+        ax_left.set_title("Left wrist")
+        ax_left.axis("off")
+        im_right = ax_right.imshow(right_imgs[0])
+        ax_right.set_title("Right wrist")
+        ax_right.axis("off")
 
         ax_value.set_xlim(0, L - 1)
         ax_value.set_ylim(-1.1, 0.1)
@@ -409,8 +364,8 @@ def eval_one_episode(args):
         line_adv, = ax_adv.plot([], [], "b-", label=f"Pred Advantage (n={N})", linewidth=1.5, alpha=0.9)
         _ = ax_adv.axhline(y=eps, color="gray", linestyle=":", linewidth=1.2, alpha=0.8)
 
-        it_strip = ax_value.scatter(frames, np.full_like(frames, -1.05, dtype=np.float32),
-                                    c=it_colors, s=10, marker="s", alpha=0.8)
+        _ = ax_value.scatter(frames, np.full_like(frames, -1.05, dtype=np.float32),
+                             c=it_colors, s=10, marker="s", alpha=0.8)
 
         scatter_v = ax_value.scatter([], [], c="red", s=80, zorder=5, edgecolors="white", linewidths=1.5)
         scatter_a = ax_adv.scatter([], [], c="blue", s=60, zorder=5, edgecolors="white", linewidths=1.2)
@@ -428,19 +383,19 @@ def eval_one_episode(args):
         ax_value.legend(h1 + h2, l1 + l2, loc="lower right", fontsize=9)
 
         title = fig.suptitle(
-            f"Task: {prompt0}\nFrame: 0/{L-1} | Status: {status_text}",
-            fontsize=11, fontweight="bold"
+            f"Task: {prompt0}\nFrame: 0/{L - 1} | Status: {status_text}",
+            fontsize=11, fontweight="bold",
         )
         plt.tight_layout(rect=[0, 0, 1, 0.93])
 
-        def update(frame):
+        def update(frame: int):
             im_head.set_array(head_imgs[frame])
             im_left.set_array(left_imgs[frame])
             im_right.set_array(right_imgs[frame])
 
-            line_pred.set_data(frames[:frame+1], pred_values_np[:frame+1])
-            line_true.set_data(frames[:frame+1], true_values_np[:frame+1])
-            line_adv.set_data(frames[:frame+1], adv[:frame+1])
+            line_pred.set_data(frames[:frame + 1], pred_values_np[:frame + 1])
+            line_true.set_data(frames[:frame + 1], true_values_np[:frame + 1])
+            line_adv.set_data(frames[:frame + 1], adv[:frame + 1])
 
             vline.set_xdata([frame, frame])
             scatter_v.set_offsets([[frame, float(pred_values_np[frame])]])
@@ -455,16 +410,33 @@ def eval_one_episode(args):
                 f"A_pred(n={N})={adv[frame]:.4f}"
             )
             title.set_text(
-                f"Task: {prompt0}\nFrame: {frame}/{L-1} | Status: {status_text} | I_t={it_flag}"
+                f"Task: {prompt0}\nFrame: {frame}/{L - 1} | Status: {status_text} | I_t={it_flag}"
             )
-            return (im_head, im_left, im_right, line_pred, line_true, vline, scatter_v, info_text, title, line_adv, scatter_a)
+            return (
+                im_head,
+                im_left,
+                im_right,
+                line_pred,
+                line_true,
+                vline,
+                scatter_v,
+                info_text,
+                title,
+                line_adv,
+                scatter_a,
+            )
 
         anim = FuncAnimation(fig, update, frames=L, interval=50, blit=False)
-        anim.save(str(video_path), writer="ffmpeg", fps=int(args.video_fps), dpi=100, bitrate=int(args.video_bitrate))
+        anim.save(
+            str(video_path),
+            writer="ffmpeg",
+            fps=int(args.video_fps),
+            dpi=100,
+            bitrate=int(args.video_bitrate),
+        )
         plt.close()
         print(f"[Saved] video: {video_path}")
 
-    # return for potential upstream usage
     return {
         "episode_id": eid,
         "task_name": task_name,
@@ -490,36 +462,29 @@ def main():
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--amp", action="store_true")
 
-    # model args (fallback; will prefer ckpt['args'] if present)
     p.add_argument("--siglip_variant", type=str, default=None)
     p.add_argument("--gemma_variant", type=str, default=None)
     p.add_argument("--hidden_dim", type=int, default=None)
     p.add_argument("--freeze_vision", action="store_true")
     p.add_argument("--freeze_llm", action="store_true")
 
-    # cameras
     p.add_argument("--cam_head_key", type=str, default="observation.images.cam_high_rgb")
     p.add_argument("--cam_left_key", type=str, default="observation.images.cam_left_wrist_rgb")
     p.add_argument("--cam_right_key", type=str, default="observation.images.cam_right_wrist_rgb")
 
-    # choose episode
     p.add_argument("--episode_id", type=str, default=None, help="episode id (requires meta)")
     p.add_argument("--episode_index", type=int, default=None, help="episode order index (requires meta)")
 
-    # advantage / It
     p.add_argument("--adv_n", type=int, default=50)
     p.add_argument("--it_percentile", type=float, default=30.0)
     p.add_argument("--c_fail", type=float, default=50.0)
     p.add_argument("--denom", type=float, default=None, help="override denom for reward scaling; else estimated from true_values slope")
 
-    # controls
     p.add_argument("--max_steps", type=int, default=None, help="limit steps for faster visualization")
     p.add_argument("--video_stride", type=int, default=1, help="take every k-th frame")
 
-    # outputs
     p.add_argument("--out_dir", type=str, default="./eval_outputs")
 
-    # video
     p.add_argument("--save_video", action="store_true")
     p.add_argument("--video_fps", type=int, default=20)
     p.add_argument("--video_bitrate", type=int, default=2000)
